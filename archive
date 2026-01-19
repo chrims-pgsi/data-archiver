@@ -1,0 +1,755 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "rich>=13.0.0",
+#     "dateparser>=1.2.0",
+#     "xxhash>=3.4.0",
+# ]
+# ///
+"""
+Data Archiver - Archive files older than a specified date.
+
+A multi-process file archiver that copies files from a source directory tree
+to a destination, preserving directory structure. Uses fast hashing to verify
+file integrity and detect conflicts.
+"""
+
+import argparse
+import hashlib
+import logging
+import multiprocessing as mp
+import os
+import shutil
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum, auto
+from multiprocessing import Process, Queue, Value
+from pathlib import Path
+from typing import Optional
+
+import dateparser
+import xxhash
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+
+# Constants
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
+NUM_WORKERS = max(8, mp.cpu_count())
+SENTINEL = None  # Signal to workers that crawling is done
+
+console = Console()
+
+
+class FileAction(Enum):
+    """Actions that can be taken on a file."""
+    COPIED = auto()
+    SKIPPED_EXISTS = auto()
+    SKIPPED_NEWER = auto()
+    CONFLICT = auto()
+    MTIME_UPDATED = auto()
+    ERROR = auto()
+
+
+@dataclass
+class FileTask:
+    """A file to be processed."""
+    source_path: Path
+    dest_path: Path
+    relative_path: Path
+    source_mtime: float
+    source_size: int
+
+
+@dataclass
+class FileResult:
+    """Result of processing a file."""
+    task: FileTask
+    action: FileAction
+    source_hash: Optional[str] = None
+    dest_hash: Optional[str] = None
+    error_message: Optional[str] = None
+    bytes_copied: int = 0
+
+
+@dataclass
+class ArchiveStats:
+    """Statistics for the archive operation."""
+    files_processed: int = 0
+    files_copied: int = 0
+    files_skipped: int = 0
+    files_mtime_updated: int = 0
+    conflicts: int = 0
+    errors: int = 0
+    bytes_copied: int = 0
+    bytes_processed: int = 0
+    directories_crawled: int = 0
+    total_files_found: int = 0
+    start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
+    conflict_files: list = field(default_factory=list)
+
+
+def setup_logging(log_directory: Path, timestamp: str) -> logging.Logger:
+    """Set up logging to file with verbose output."""
+    log_file = log_directory / f"data-archiver-{timestamp}.log"
+
+    # Create file handler with detailed formatting
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+
+    # Create logger
+    logger = logging.getLogger('data-archiver')
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def parse_date(date_string: str) -> datetime:
+    """Parse a flexible date string into a datetime object."""
+    # Try dateparser for natural language dates
+    parsed = dateparser.parse(
+        date_string,
+        settings={
+            'PREFER_DATES_FROM': 'past',
+            'RETURN_AS_TIMEZONE_AWARE': False,
+        }
+    )
+
+    if parsed is None:
+        # Try some common formats directly
+        formats = ['%Y', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y']
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(date_string, fmt)
+                break
+            except ValueError:
+                continue
+
+    if parsed is None:
+        raise ValueError(f"Could not parse date: {date_string}")
+
+    return parsed
+
+
+def compute_hash(filepath: Path) -> str:
+    """Compute xxhash of a file for fast comparison."""
+    hasher = xxhash.xxh3_128()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(CHUNK_SIZE):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def format_bytes(num_bytes: int) -> str:
+    """Format bytes as human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} EB"
+
+
+def format_duration(seconds: float) -> str:
+    """Format duration as human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.2f}m"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.2f}h"
+
+
+def crawler_process(
+    source_dir: Path,
+    dest_dir: Path,
+    cutoff_date: datetime,
+    task_queue: Queue,
+    stats_queue: Queue,
+    crawl_done: Value,
+    dry_run: bool,
+):
+    """Crawl the source directory and queue files for processing."""
+    dirs_crawled = 0
+    files_found = 0
+    cutoff_timestamp = cutoff_date.timestamp()
+
+    try:
+        for root, dirs, files in os.walk(source_dir):
+            root_path = Path(root)
+            dirs_crawled += 1
+
+            for filename in files:
+                source_path = root_path / filename
+
+                try:
+                    stat_info = source_path.stat()
+                    mtime = stat_info.st_mtime
+                    size = stat_info.st_size
+
+                    # Check if file is older than cutoff
+                    if mtime < cutoff_timestamp:
+                        relative_path = source_path.relative_to(source_dir)
+                        dest_path = dest_dir / relative_path
+
+                        task = FileTask(
+                            source_path=source_path,
+                            dest_path=dest_path,
+                            relative_path=relative_path,
+                            source_mtime=mtime,
+                            source_size=size,
+                        )
+                        task_queue.put(task)
+                        files_found += 1
+
+                except (PermissionError, OSError) as e:
+                    stats_queue.put(('error', str(source_path), str(e)))
+
+    except Exception as e:
+        stats_queue.put(('crawler_error', str(e)))
+    finally:
+        # Signal completion
+        stats_queue.put(('crawl_complete', dirs_crawled, files_found))
+        crawl_done.value = 1
+
+
+def worker_process(
+    worker_id: int,
+    task_queue: Queue,
+    result_queue: Queue,
+    crawl_done: Value,
+    dry_run: bool,
+):
+    """Worker process that hashes and copies files."""
+    while True:
+        try:
+            # Check if we should exit
+            try:
+                task = task_queue.get(timeout=0.1)
+            except:
+                # Queue is empty, check if crawling is done
+                if crawl_done.value == 1 and task_queue.empty():
+                    break
+                continue
+
+            if task is SENTINEL:
+                break
+
+            result = process_file(task, dry_run)
+            result_queue.put(result)
+
+        except Exception as e:
+            # Should not happen, but log it
+            result_queue.put(FileResult(
+                task=task if 'task' in dir() else None,
+                action=FileAction.ERROR,
+                error_message=f"Worker {worker_id} error: {str(e)}"
+            ))
+
+
+def process_file(task: FileTask, dry_run: bool) -> FileResult:
+    """Process a single file - hash, compare, and copy if needed."""
+    try:
+        # Check if destination exists
+        if task.dest_path.exists():
+            dest_stat = task.dest_path.stat()
+            dest_size = dest_stat.st_size
+            dest_mtime = dest_stat.st_mtime
+
+            # Quick size check first
+            if dest_size != task.source_size:
+                # Conflict - different sizes
+                source_hash = compute_hash(task.source_path)
+                return FileResult(
+                    task=task,
+                    action=FileAction.CONFLICT,
+                    source_hash=source_hash,
+                    error_message=f"Size mismatch: source={task.source_size}, dest={dest_size}"
+                )
+
+            # Same size - compute hashes
+            source_hash = compute_hash(task.source_path)
+            dest_hash = compute_hash(task.dest_path)
+
+            if source_hash != dest_hash:
+                # Conflict - same size but different content
+                return FileResult(
+                    task=task,
+                    action=FileAction.CONFLICT,
+                    source_hash=source_hash,
+                    dest_hash=dest_hash,
+                    error_message="Hash mismatch with same size"
+                )
+
+            # Files are identical - check mtime
+            if abs(dest_mtime - task.source_mtime) > 1:  # 1 second tolerance
+                if not dry_run:
+                    os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
+                return FileResult(
+                    task=task,
+                    action=FileAction.MTIME_UPDATED,
+                    source_hash=source_hash,
+                )
+
+            # File already exists and is identical
+            return FileResult(
+                task=task,
+                action=FileAction.SKIPPED_EXISTS,
+                source_hash=source_hash,
+            )
+
+        # Destination doesn't exist - copy the file
+        source_hash = compute_hash(task.source_path)
+
+        if not dry_run:
+            # Ensure destination directory exists
+            task.dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Copy file
+            shutil.copy2(task.source_path, task.dest_path)
+
+            # Ensure mtime is set correctly
+            os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
+
+        return FileResult(
+            task=task,
+            action=FileAction.COPIED,
+            source_hash=source_hash,
+            bytes_copied=task.source_size,
+        )
+
+    except Exception as e:
+        return FileResult(
+            task=task,
+            action=FileAction.ERROR,
+            error_message=str(e)
+        )
+
+
+def run_archive(
+    source: Path,
+    destination: Path,
+    cutoff_date: datetime,
+    log_directory: Path,
+    dry_run: bool,
+) -> ArchiveStats:
+    """Run the archive operation."""
+    timestamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
+
+    # Setup logging
+    log_directory.mkdir(parents=True, exist_ok=True)
+    logger = setup_logging(log_directory, timestamp)
+
+    # Log startup info
+    logger.info("=" * 80)
+    logger.info("DATA ARCHIVER STARTED")
+    logger.info("=" * 80)
+    logger.info(f"Source: {source}")
+    logger.info(f"Destination: {destination}")
+    logger.info(f"Cutoff date: {cutoff_date}")
+    logger.info(f"Dry run: {dry_run}")
+    logger.info(f"Workers: {NUM_WORKERS}")
+    logger.info("=" * 80)
+
+    stats = ArchiveStats()
+    stats.start_time = time.time()
+
+    # Create queues for inter-process communication
+    task_queue = mp.Queue(maxsize=10000)
+    result_queue = mp.Queue()
+    stats_queue = mp.Queue()
+    crawl_done = mp.Value('i', 0)
+
+    # Start crawler process
+    crawler = Process(
+        target=crawler_process,
+        args=(source, destination, cutoff_date, task_queue, stats_queue, crawl_done, dry_run)
+    )
+    crawler.start()
+
+    # Start worker processes
+    workers = []
+    for i in range(NUM_WORKERS):
+        w = Process(
+            target=worker_process,
+            args=(i, task_queue, result_queue, crawl_done, dry_run)
+        )
+        w.start()
+        workers.append(w)
+
+    # Process results with progress display
+    crawl_complete = False
+    total_files = 0
+    processed_files = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        refresh_per_second=10,
+    ) as progress:
+
+        # Start with indeterminate progress (spinner)
+        task_id = progress.add_task(
+            "[cyan]Crawling directories...",
+            total=None,
+        )
+
+        active_workers = NUM_WORKERS
+
+        while active_workers > 0 or not result_queue.empty() or not stats_queue.empty():
+            # Check stats queue for crawler updates
+            while not stats_queue.empty():
+                try:
+                    msg = stats_queue.get_nowait()
+                    if msg[0] == 'crawl_complete':
+                        crawl_complete = True
+                        stats.directories_crawled = msg[1]
+                        total_files = msg[2]
+                        stats.total_files_found = total_files
+
+                        # Switch to determinate progress bar
+                        progress.update(
+                            task_id,
+                            description="[green]Processing files...",
+                            total=total_files,
+                            completed=processed_files,
+                        )
+                        logger.info(f"Crawling complete: {stats.directories_crawled} directories, {total_files} files to process")
+
+                    elif msg[0] == 'error':
+                        logger.error(f"Error accessing {msg[1]}: {msg[2]}")
+                        stats.errors += 1
+
+                    elif msg[0] == 'crawler_error':
+                        logger.error(f"Crawler error: {msg[1]}")
+
+                except:
+                    break
+
+            # Process results
+            while not result_queue.empty():
+                try:
+                    result = result_queue.get_nowait()
+                    processed_files += 1
+                    stats.files_processed += 1
+
+                    if result.task:
+                        stats.bytes_processed += result.task.source_size
+
+                    # Update progress
+                    if crawl_complete:
+                        progress.update(task_id, completed=processed_files)
+                    else:
+                        progress.update(
+                            task_id,
+                            description=f"[cyan]Crawling... ({processed_files} files processed)"
+                        )
+
+                    # Log the result
+                    log_result(logger, result, dry_run)
+
+                    # Update stats
+                    if result.action == FileAction.COPIED:
+                        stats.files_copied += 1
+                        stats.bytes_copied += result.bytes_copied
+                    elif result.action == FileAction.SKIPPED_EXISTS:
+                        stats.files_skipped += 1
+                    elif result.action == FileAction.MTIME_UPDATED:
+                        stats.files_mtime_updated += 1
+                    elif result.action == FileAction.CONFLICT:
+                        stats.conflicts += 1
+                        stats.conflict_files.append(str(result.task.source_path))
+                    elif result.action == FileAction.ERROR:
+                        stats.errors += 1
+
+                except:
+                    break
+
+            # Check if workers are done
+            alive_workers = sum(1 for w in workers if w.is_alive())
+            if alive_workers == 0 and crawl_done.value == 1:
+                active_workers = 0
+
+            time.sleep(0.05)
+
+    # Wait for all processes to complete
+    crawler.join(timeout=5)
+    for w in workers:
+        w.join(timeout=5)
+
+    stats.end_time = time.time()
+
+    # Write conflicts file
+    if stats.conflict_files:
+        conflicts_file = log_directory / f"conflicts-{timestamp}.txt"
+        with open(conflicts_file, 'w') as f:
+            for path in stats.conflict_files:
+                f.write(f"{path}\n")
+        logger.info(f"Conflicts written to: {conflicts_file}")
+
+    # Log final summary
+    log_summary(logger, stats, dry_run)
+
+    return stats
+
+
+def log_result(logger: logging.Logger, result: FileResult, dry_run: bool):
+    """Log a file processing result."""
+    prefix = "[DRY RUN] " if dry_run else ""
+
+    if result.task is None:
+        logger.error(f"Received result with no task: {result.error_message}")
+        return
+
+    path = result.task.relative_path
+
+    if result.action == FileAction.COPIED:
+        logger.info(
+            f"{prefix}COPIED: {path} | "
+            f"size={result.task.source_size} | "
+            f"hash={result.source_hash}"
+        )
+    elif result.action == FileAction.SKIPPED_EXISTS:
+        logger.debug(
+            f"{prefix}SKIPPED (exists): {path} | "
+            f"hash={result.source_hash}"
+        )
+    elif result.action == FileAction.MTIME_UPDATED:
+        logger.info(
+            f"{prefix}MTIME UPDATED: {path} | "
+            f"hash={result.source_hash}"
+        )
+    elif result.action == FileAction.CONFLICT:
+        logger.warning(
+            f"{prefix}CONFLICT: {path} | "
+            f"source_hash={result.source_hash} | "
+            f"dest_hash={result.dest_hash} | "
+            f"{result.error_message}"
+        )
+    elif result.action == FileAction.ERROR:
+        logger.error(
+            f"{prefix}ERROR: {path} | "
+            f"{result.error_message}"
+        )
+
+
+def log_summary(logger: logging.Logger, stats: ArchiveStats, dry_run: bool):
+    """Log the final summary."""
+    duration = stats.end_time - stats.start_time
+
+    logger.info("=" * 80)
+    logger.info("ARCHIVE SUMMARY" + (" (DRY RUN)" if dry_run else ""))
+    logger.info("=" * 80)
+    logger.info(f"Directories crawled: {stats.directories_crawled:,}")
+    logger.info(f"Total files found (older than cutoff): {stats.total_files_found:,}")
+    logger.info(f"Files processed: {stats.files_processed:,}")
+    logger.info(f"Files copied: {stats.files_copied:,}")
+    logger.info(f"Files skipped (already exist): {stats.files_skipped:,}")
+    logger.info(f"Files with mtime updated: {stats.files_mtime_updated:,}")
+    logger.info(f"Conflicts: {stats.conflicts:,}")
+    logger.info(f"Errors: {stats.errors:,}")
+    logger.info(f"Bytes copied: {stats.bytes_copied:,} ({format_bytes(stats.bytes_copied)})")
+    logger.info(f"Bytes processed: {stats.bytes_processed:,} ({format_bytes(stats.bytes_processed)})")
+    logger.info(f"Total runtime: {format_duration(duration)}")
+    if stats.files_processed > 0:
+        logger.info(f"Average time per file: {(duration / stats.files_processed) * 1000:.2f}ms")
+    logger.info("=" * 80)
+
+
+def print_summary(stats: ArchiveStats, dry_run: bool):
+    """Print a colorful summary to the console."""
+    duration = stats.end_time - stats.start_time
+
+    table = Table(
+        title="[bold]Archive Summary" + (" (DRY RUN)" if dry_run else ""),
+        title_style="bold magenta",
+        border_style="blue",
+    )
+
+    table.add_column("Metric", style="cyan", no_wrap=True)
+    table.add_column("Value", style="green", justify="right")
+
+    table.add_row("Directories crawled", f"{stats.directories_crawled:,}")
+    table.add_row("Files found (older than cutoff)", f"{stats.total_files_found:,}")
+    table.add_row("Files processed", f"{stats.files_processed:,}")
+    table.add_row("Files copied", f"[bold green]{stats.files_copied:,}[/]")
+    table.add_row("Files skipped (exist)", f"{stats.files_skipped:,}")
+    table.add_row("Files mtime updated", f"{stats.files_mtime_updated:,}")
+
+    if stats.conflicts > 0:
+        table.add_row("Conflicts", f"[bold red]{stats.conflicts:,}[/]")
+    else:
+        table.add_row("Conflicts", f"{stats.conflicts:,}")
+
+    if stats.errors > 0:
+        table.add_row("Errors", f"[bold red]{stats.errors:,}[/]")
+    else:
+        table.add_row("Errors", f"{stats.errors:,}")
+
+    table.add_row("", "")
+    table.add_row("Bytes copied", f"{stats.bytes_copied:,}")
+    table.add_row("Bytes copied (human)", f"[bold]{format_bytes(stats.bytes_copied)}[/]")
+    table.add_row("Bytes processed", f"{stats.bytes_processed:,}")
+    table.add_row("Bytes processed (human)", f"{format_bytes(stats.bytes_processed)}")
+    table.add_row("", "")
+    table.add_row("Total runtime", f"[bold]{format_duration(duration)}[/]")
+
+    if stats.files_processed > 0:
+        table.add_row("Avg time per file", f"{(duration / stats.files_processed) * 1000:.2f}ms")
+        throughput = stats.bytes_processed / duration if duration > 0 else 0
+        table.add_row("Throughput", f"{format_bytes(throughput)}/s")
+
+    console.print()
+    console.print(table)
+
+    if stats.conflicts > 0:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold yellow]Warning:[/] {stats.conflicts} conflict(s) detected!\n"
+                "Files with the same path but different content were found.\n"
+                "Check the conflicts file in the log directory for details.",
+                title="[bold red]Conflicts Detected",
+                border_style="red",
+            )
+        )
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Archive files older than a specified date.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --source /data --destination /archive --older-than '3 years ago'
+  %(prog)s --source /data --destination /archive --older-than '2021'
+  %(prog)s --source /data --destination /archive --older-than '2025-06-01'
+  %(prog)s --source /data --destination /archive --older-than 'January 2023' --dry-run
+        """,
+    )
+
+    parser.add_argument(
+        '--source', '-s',
+        type=Path,
+        required=True,
+        help='Source directory to archive from',
+    )
+    parser.add_argument(
+        '--destination', '-d',
+        type=Path,
+        required=True,
+        help='Destination directory to archive to',
+    )
+    parser.add_argument(
+        '--older-than', '-o',
+        type=str,
+        required=True,
+        dest='older_than',
+        help='Archive files older than this date (e.g., "3 years ago", "2021", "2025-06-01")',
+    )
+    parser.add_argument(
+        '--log-directory', '-l',
+        type=Path,
+        default=Path.cwd(),
+        dest='log_directory',
+        help='Directory for log files (default: current directory)',
+    )
+    parser.add_argument(
+        '--dry-run', '-n',
+        action='store_true',
+        dest='dry_run',
+        help='Show what would be done without actually copying files',
+    )
+
+    args = parser.parse_args()
+
+    # Validate source directory
+    if not args.source.exists():
+        console.print(f"[bold red]Error:[/] Source directory does not exist: {args.source}")
+        sys.exit(1)
+
+    if not args.source.is_dir():
+        console.print(f"[bold red]Error:[/] Source is not a directory: {args.source}")
+        sys.exit(1)
+
+    # Parse the cutoff date
+    try:
+        cutoff_date = parse_date(args.older_than)
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/] {e}")
+        sys.exit(1)
+
+    # Display configuration
+    console.print()
+    console.print(Panel(
+        f"[bold]Source:[/] {args.source}\n"
+        f"[bold]Destination:[/] {args.destination}\n"
+        f"[bold]Older than:[/] {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"[bold]Log directory:[/] {args.log_directory}\n"
+        f"[bold]Workers:[/] {NUM_WORKERS}\n"
+        f"[bold]Dry run:[/] {'Yes' if args.dry_run else 'No'}",
+        title="[bold blue]Data Archiver Configuration",
+        border_style="blue",
+    ))
+    console.print()
+
+    if args.dry_run:
+        console.print("[bold yellow]DRY RUN MODE - No files will be copied[/]\n")
+
+    # Run the archive
+    try:
+        stats = run_archive(
+            source=args.source.resolve(),
+            destination=args.destination.resolve(),
+            cutoff_date=cutoff_date,
+            log_directory=args.log_directory.resolve(),
+            dry_run=args.dry_run,
+        )
+
+        # Print summary
+        print_summary(stats, args.dry_run)
+
+        # Exit with error code if there were problems
+        if stats.errors > 0 or stats.conflicts > 0:
+            sys.exit(1)
+
+    except KeyboardInterrupt:
+        console.print("\n[bold red]Interrupted by user[/]")
+        sys.exit(130)
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/] {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
