@@ -442,15 +442,6 @@ def run_archive(
     crawl_done = mp.Value('i', 0)
     interrupted = mp.Value('i', 0)
 
-    # Set up signal handler for graceful shutdown
-    def signal_handler(signum, frame):
-        interrupted.value = 1
-        console.print("\n[bold yellow]Signal received, shutting down gracefully...[/]")
-        logger.info("Interrupt signal received, shutting down...")
-
-    original_sigint = signal.signal(signal.SIGINT, signal_handler)
-    original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
-
     # Start crawler process
     crawler = Process(
         target=crawler_process,
@@ -467,6 +458,16 @@ def run_archive(
         )
         w.start()
         workers.append(w)
+
+    # Set up signal handler AFTER starting children (so they don't inherit it)
+    def signal_handler(signum, frame):
+        if interrupted.value == 0:  # Only print once
+            interrupted.value = 1
+            console.print("\n[bold yellow]Signal received, shutting down gracefully...[/]")
+            logger.info("Interrupt signal received, shutting down...")
+
+    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
 
     # Process results with progress display
     crawl_complete = False
