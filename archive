@@ -52,8 +52,19 @@ from rich.text import Text
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
 NUM_WORKERS = max(8, mp.cpu_count())
 SENTINEL = None  # Signal to workers that crawling is done
+APP_NAME = "data-archiver"
 
 console = Console()
+
+
+def get_default_log_directory() -> Path:
+    """Get XDG-compliant default log directory."""
+    xdg_state_home = os.environ.get('XDG_STATE_HOME')
+    if xdg_state_home:
+        base = Path(xdg_state_home)
+    else:
+        base = Path.home() / '.local' / 'state'
+    return base / APP_NAME
 
 
 class FileAction(Enum):
@@ -680,9 +691,9 @@ Examples:
     parser.add_argument(
         '--log-directory', '-l',
         type=Path,
-        default=Path.cwd(),
+        default=get_default_log_directory(),
         dest='log_directory',
-        help='Directory for log files (default: current directory)',
+        help='Directory for log files (default: ~/.local/state/data-archiver)',
     )
     parser.add_argument(
         '--dry-run', '-n',

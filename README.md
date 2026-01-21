@@ -59,7 +59,7 @@ options:
   --older-than, -o OLDER_THAN
                         Archive files older than this date
   --log-directory, -l LOG_DIRECTORY
-                        Directory for log files (default: current directory)
+                        Directory for log files (default: ~/.local/state/data-archiver)
   --dry-run, -n         Show what would be done without actually copying files
 ```
 
