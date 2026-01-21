@@ -584,17 +584,16 @@ def run_archive(
     if interrupted.value:
         stats.interrupted = True
         logger.info("Interrupted - terminating workers...")
-        console.print("[yellow]Terminating workers...[/]")
 
-        # Terminate all processes
-        crawler.terminate()
+        # Kill all processes immediately (SIGKILL)
+        if crawler.is_alive():
+            crawler.kill()
         for w in workers:
-            w.terminate()
+            if w.is_alive():
+                w.kill()
 
-        # Wait briefly for termination
-        crawler.join(timeout=2)
-        for w in workers:
-            w.join(timeout=2)
+        # Brief wait, then move on (don't block for each process)
+        time.sleep(0.1)
     else:
         # Wait for all processes to complete normally
         crawler.join(timeout=5)
