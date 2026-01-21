@@ -193,9 +193,26 @@ def parse_date(date_string: str) -> datetime:
 def compute_hash(filepath: Path) -> str:
     """Compute xxhash of a file for fast comparison."""
     hasher = xxhash.xxh3_128()
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(CHUNK_SIZE):
+    try:
+        f = open(filepath, 'rb')
+    except Exception as e:
+        raise OSError(f"opening file for hashing: {e}") from e
+
+    try:
+        bytes_read = 0
+        while True:
+            try:
+                chunk = f.read(CHUNK_SIZE)
+            except Exception as e:
+                raise OSError(f"reading file at byte {bytes_read}: {e}") from e
+
+            if not chunk:
+                break
+            bytes_read += len(chunk)
             hasher.update(chunk)
+    finally:
+        f.close()
+
     return hasher.hexdigest()
 
 
@@ -310,9 +327,12 @@ def worker_process(
 
 def process_file(task: FileTask, dry_run: bool) -> FileResult:
     """Process a single file - hash, compare, and copy if needed."""
+    operation = "starting"
     try:
         # Check if destination exists
+        operation = "checking if destination exists"
         if task.dest_path.exists():
+            operation = "stat'ing destination"
             dest_stat = task.dest_path.stat()
             dest_size = dest_stat.st_size
             dest_mtime = dest_stat.st_mtime
@@ -328,6 +348,7 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
             # Same size and same mtime = assume identical (no need to hash)
             if abs(dest_mtime - task.source_mtime) <= 1:  # 1 second tolerance
                 if not dry_run:
+                    operation = "deleting source (already archived)"
                     task.source_path.unlink()
                 return FileResult(
                     task=task,
@@ -335,7 +356,9 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
                 )
 
             # Same size but different mtime = need to hash to verify
+            operation = "hashing source file"
             source_hash = compute_hash(task.source_path)
+            operation = "hashing destination file"
             dest_hash = compute_hash(task.dest_path)
 
             if source_hash != dest_hash:
@@ -350,7 +373,9 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
 
             # Hashes match - update dest mtime to match source, delete source
             if not dry_run:
+                operation = "updating destination mtime"
                 os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
+                operation = "deleting source (verified match)"
                 task.source_path.unlink()
             return FileResult(
                 task=task,
@@ -359,22 +384,28 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
             )
 
         # Destination doesn't exist - move the file (copy, verify, delete source)
+        operation = "hashing source file"
         source_hash = compute_hash(task.source_path)
 
         if not dry_run:
             # Ensure destination directory exists
+            operation = "creating destination directory"
             task.dest_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Copy file
+            operation = "copying file to destination"
             shutil.copy2(task.source_path, task.dest_path)
 
             # Ensure mtime is set correctly
+            operation = "setting destination mtime"
             os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
 
             # Verify the copy by checking hash
+            operation = "verifying destination hash"
             dest_hash = compute_hash(task.dest_path)
             if dest_hash != source_hash:
                 # Copy failed verification - remove bad copy, report error
+                operation = "removing bad copy"
                 task.dest_path.unlink()
                 return FileResult(
                     task=task,
@@ -385,6 +416,7 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
                 )
 
             # Delete source file after successful copy
+            operation = "deleting source after successful copy"
             task.source_path.unlink()
 
         return FileResult(
@@ -398,7 +430,7 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
         return FileResult(
             task=task,
             action=FileAction.ERROR,
-            error_message=str(e)
+            error_message=f"while {operation}: {e}"
         )
 
 
