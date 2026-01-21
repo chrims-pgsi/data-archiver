@@ -107,8 +107,10 @@ class ArchiveStats:
     files_mtime_updated: int = 0
     conflicts: int = 0
     errors: int = 0
-    bytes_moved: int = 0
-    bytes_processed: int = 0
+    bytes_moved: int = 0           # Bytes copied to destination
+    bytes_skipped: int = 0         # Bytes of already-existing files
+    bytes_mtime_updated: int = 0   # Bytes of files needing mtime update
+    bytes_hashed: int = 0          # Bytes actually hashed (for throughput)
     directories_crawled: int = 0
     total_files_found: int = 0
     start_time: float = field(default_factory=time.time)
@@ -116,6 +118,16 @@ class ArchiveStats:
     conflict_files: list = field(default_factory=list)
     log_file: Optional[Path] = None
     conflicts_file: Optional[Path] = None
+
+    @property
+    def files_removed(self) -> int:
+        """Total files removed from source."""
+        return self.files_moved + self.files_skipped + self.files_mtime_updated
+
+    @property
+    def bytes_freed(self) -> int:
+        """Total bytes freed from source."""
+        return self.bytes_moved + self.bytes_skipped + self.bytes_mtime_updated
 
 
 def setup_logging(log_directory: Path, timestamp: str) -> logging.Logger:
@@ -506,9 +518,6 @@ def run_archive(
                     processed_files += 1
                     stats.files_processed += 1
 
-                    if result.task:
-                        stats.bytes_processed += result.task.source_size
-
                     # Update progress
                     if crawl_complete:
                         progress.update(task_id, completed=processed_files)
@@ -521,14 +530,23 @@ def run_archive(
                     # Log the result
                     log_result(logger, result, dry_run)
 
+                    # Track bytes hashed (if source_hash is set, we hashed files)
+                    if result.task and result.source_hash:
+                        # Hashed source + dest (for verify or compare)
+                        stats.bytes_hashed += result.task.source_size * 2
+
                     # Update stats
                     if result.action == FileAction.MOVED:
                         stats.files_moved += 1
                         stats.bytes_moved += result.bytes_moved
                     elif result.action == FileAction.SKIPPED_EXISTS:
                         stats.files_skipped += 1
+                        if result.task:
+                            stats.bytes_skipped += result.task.source_size
                     elif result.action == FileAction.MTIME_UPDATED:
                         stats.files_mtime_updated += 1
+                        if result.task:
+                            stats.bytes_mtime_updated += result.task.source_size
                     elif result.action == FileAction.CONFLICT:
                         stats.conflicts += 1
                         stats.conflict_files.append(str(result.task.source_path))
@@ -627,11 +645,17 @@ def log_summary(logger: logging.Logger, stats: ArchiveStats, dry_run: bool):
     logger.info(f"Files with mtime updated: {stats.files_mtime_updated:,}")
     logger.info(f"Conflicts: {stats.conflicts:,}")
     logger.info(f"Errors: {stats.errors:,}")
-    logger.info(f"Bytes moved: {stats.bytes_moved:,} ({format_bytes(stats.bytes_moved)})")
-    logger.info(f"Bytes processed: {stats.bytes_processed:,} ({format_bytes(stats.bytes_processed)})")
+    logger.info("-" * 40)
+    logger.info(f"Source files removed: {stats.files_removed:,}")
+    logger.info(f"Source space freed: {stats.bytes_freed:,} ({format_bytes(stats.bytes_freed)})")
+    logger.info(f"Bytes copied to dest: {stats.bytes_moved:,} ({format_bytes(stats.bytes_moved)})")
+    logger.info(f"Bytes hashed: {stats.bytes_hashed:,} ({format_bytes(stats.bytes_hashed)})")
+    logger.info("-" * 40)
     logger.info(f"Total runtime: {format_duration(duration)}")
     if stats.files_processed > 0:
         logger.info(f"Average time per file: {(duration / stats.files_processed) * 1000:.2f}ms")
+    if stats.bytes_hashed > 0 and duration > 0:
+        logger.info(f"Hash throughput: {format_bytes(stats.bytes_hashed / duration)}/s")
     logger.info("=" * 80)
 
 
@@ -651,8 +675,9 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
     table.add_row("Directories crawled", f"{stats.directories_crawled:,}")
     table.add_row("Files found (older than cutoff)", f"{stats.total_files_found:,}")
     table.add_row("Files processed", f"{stats.files_processed:,}")
-    table.add_row("Files moved", f"[bold green]{stats.files_moved:,}[/]")
-    table.add_row("Files skipped (exist)", f"{stats.files_skipped:,}")
+    table.add_row("", "")
+    table.add_row("Files moved (new)", f"[bold green]{stats.files_moved:,}[/]")
+    table.add_row("Files skipped (already archived)", f"{stats.files_skipped:,}")
     table.add_row("Files mtime updated", f"{stats.files_mtime_updated:,}")
 
     if stats.conflicts > 0:
@@ -666,17 +691,18 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
         table.add_row("Errors", f"{stats.errors:,}")
 
     table.add_row("", "")
-    table.add_row("Bytes moved", f"{stats.bytes_moved:,}")
-    table.add_row("Bytes moved (human)", f"[bold]{format_bytes(stats.bytes_moved)}[/]")
-    table.add_row("Bytes processed", f"{stats.bytes_processed:,}")
-    table.add_row("Bytes processed (human)", f"{format_bytes(stats.bytes_processed)}")
+    table.add_row("[bold]Source files removed[/]", f"[bold]{stats.files_removed:,}[/]")
+    table.add_row("[bold]Source space freed[/]", f"[bold]{format_bytes(stats.bytes_freed)}[/] ({stats.bytes_freed:,} bytes)")
+    table.add_row("", "")
+    table.add_row("Bytes copied to destination", f"{format_bytes(stats.bytes_moved)} ({stats.bytes_moved:,})")
+    table.add_row("Bytes hashed", f"{format_bytes(stats.bytes_hashed)} ({stats.bytes_hashed:,})")
     table.add_row("", "")
     table.add_row("Total runtime", f"[bold]{format_duration(duration)}[/]")
 
     if stats.files_processed > 0:
         table.add_row("Avg time per file", f"{(duration / stats.files_processed) * 1000:.2f}ms")
-        throughput = stats.bytes_processed / duration if duration > 0 else 0
-        table.add_row("Throughput", f"{format_bytes(throughput)}/s")
+    if stats.bytes_hashed > 0 and duration > 0:
+        table.add_row("Hash throughput", f"{format_bytes(stats.bytes_hashed / duration)}/s")
 
     console.print()
     console.print(table)
