@@ -190,13 +190,28 @@ def parse_date(date_string: str) -> datetime:
     raise ValueError(f"Could not parse date: {date_string}")
 
 
-def compute_hash(filepath: Path) -> str:
-    """Compute xxhash of a file for fast comparison."""
+def compute_hash(filepath: Path, max_retries: int = 5) -> str:
+    """Compute xxhash of a file for fast comparison.
+
+    Retries on EINVAL errors which can occur on CIFS when multiple processes
+    try to open the same file (via hard links) simultaneously.
+    """
     hasher = xxhash.xxh3_128()
-    try:
-        f = open(filepath, 'rb')
-    except Exception as e:
-        raise OSError(f"opening file for hashing: {e}") from e
+
+    # Retry loop for open() - CIFS hard link contention workaround
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            f = open(filepath, 'rb')
+            break
+        except OSError as e:
+            last_error = e
+            if e.errno == 22 and attempt < max_retries - 1:  # EINVAL
+                time.sleep(0.1 * (attempt + 1))  # Backoff: 0.1s, 0.2s, 0.3s, ...
+                continue
+            raise OSError(f"opening file for hashing: {e}") from e
+    else:
+        raise OSError(f"opening file for hashing after {max_retries} retries: {last_error}") from last_error
 
     try:
         bytes_read = 0
