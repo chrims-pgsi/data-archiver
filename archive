@@ -69,7 +69,7 @@ def get_default_log_directory() -> Path:
 
 class FileAction(Enum):
     """Actions that can be taken on a file."""
-    COPIED = auto()
+    MOVED = auto()
     SKIPPED_EXISTS = auto()
     SKIPPED_NEWER = auto()
     CONFLICT = auto()
@@ -95,19 +95,19 @@ class FileResult:
     source_hash: Optional[str] = None
     dest_hash: Optional[str] = None
     error_message: Optional[str] = None
-    bytes_copied: int = 0
+    bytes_moved: int = 0
 
 
 @dataclass
 class ArchiveStats:
     """Statistics for the archive operation."""
     files_processed: int = 0
-    files_copied: int = 0
+    files_moved: int = 0
     files_skipped: int = 0
     files_mtime_updated: int = 0
     conflicts: int = 0
     errors: int = 0
-    bytes_copied: int = 0
+    bytes_moved: int = 0
     bytes_processed: int = 0
     directories_crawled: int = 0
     total_files_found: int = 0
@@ -343,7 +343,7 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
                 source_hash=source_hash,
             )
 
-        # Destination doesn't exist - copy the file
+        # Destination doesn't exist - move the file (copy, verify, delete source)
         source_hash = compute_hash(task.source_path)
 
         if not dry_run:
@@ -356,11 +356,27 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
             # Ensure mtime is set correctly
             os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
 
+            # Verify the copy by checking hash
+            dest_hash = compute_hash(task.dest_path)
+            if dest_hash != source_hash:
+                # Copy failed verification - remove bad copy, report error
+                task.dest_path.unlink()
+                return FileResult(
+                    task=task,
+                    action=FileAction.ERROR,
+                    source_hash=source_hash,
+                    dest_hash=dest_hash,
+                    error_message="Hash verification failed after copy",
+                )
+
+            # Delete source file after successful copy
+            task.source_path.unlink()
+
         return FileResult(
             task=task,
-            action=FileAction.COPIED,
+            action=FileAction.MOVED,
             source_hash=source_hash,
-            bytes_copied=task.source_size,
+            bytes_moved=task.source_size,
         )
 
     except Exception as e:
@@ -503,9 +519,9 @@ def run_archive(
                     log_result(logger, result, dry_run)
 
                     # Update stats
-                    if result.action == FileAction.COPIED:
-                        stats.files_copied += 1
-                        stats.bytes_copied += result.bytes_copied
+                    if result.action == FileAction.MOVED:
+                        stats.files_moved += 1
+                        stats.bytes_moved += result.bytes_moved
                     elif result.action == FileAction.SKIPPED_EXISTS:
                         stats.files_skipped += 1
                     elif result.action == FileAction.MTIME_UPDATED:
@@ -557,9 +573,9 @@ def log_result(logger: logging.Logger, result: FileResult, dry_run: bool):
 
     path = result.task.relative_path
 
-    if result.action == FileAction.COPIED:
+    if result.action == FileAction.MOVED:
         logger.info(
-            f"{prefix}COPIED: {path} | "
+            f"{prefix}MOVED: {path} | "
             f"size={result.task.source_size} | "
             f"hash={result.source_hash}"
         )
@@ -597,12 +613,12 @@ def log_summary(logger: logging.Logger, stats: ArchiveStats, dry_run: bool):
     logger.info(f"Directories crawled: {stats.directories_crawled:,}")
     logger.info(f"Total files found (older than cutoff): {stats.total_files_found:,}")
     logger.info(f"Files processed: {stats.files_processed:,}")
-    logger.info(f"Files copied: {stats.files_copied:,}")
+    logger.info(f"Files moved: {stats.files_moved:,}")
     logger.info(f"Files skipped (already exist): {stats.files_skipped:,}")
     logger.info(f"Files with mtime updated: {stats.files_mtime_updated:,}")
     logger.info(f"Conflicts: {stats.conflicts:,}")
     logger.info(f"Errors: {stats.errors:,}")
-    logger.info(f"Bytes copied: {stats.bytes_copied:,} ({format_bytes(stats.bytes_copied)})")
+    logger.info(f"Bytes moved: {stats.bytes_moved:,} ({format_bytes(stats.bytes_moved)})")
     logger.info(f"Bytes processed: {stats.bytes_processed:,} ({format_bytes(stats.bytes_processed)})")
     logger.info(f"Total runtime: {format_duration(duration)}")
     if stats.files_processed > 0:
@@ -626,7 +642,7 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
     table.add_row("Directories crawled", f"{stats.directories_crawled:,}")
     table.add_row("Files found (older than cutoff)", f"{stats.total_files_found:,}")
     table.add_row("Files processed", f"{stats.files_processed:,}")
-    table.add_row("Files copied", f"[bold green]{stats.files_copied:,}[/]")
+    table.add_row("Files moved", f"[bold green]{stats.files_moved:,}[/]")
     table.add_row("Files skipped (exist)", f"{stats.files_skipped:,}")
     table.add_row("Files mtime updated", f"{stats.files_mtime_updated:,}")
 
@@ -641,8 +657,8 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
         table.add_row("Errors", f"{stats.errors:,}")
 
     table.add_row("", "")
-    table.add_row("Bytes copied", f"{stats.bytes_copied:,}")
-    table.add_row("Bytes copied (human)", f"[bold]{format_bytes(stats.bytes_copied)}[/]")
+    table.add_row("Bytes moved", f"{stats.bytes_moved:,}")
+    table.add_row("Bytes moved (human)", f"[bold]{format_bytes(stats.bytes_moved)}[/]")
     table.add_row("Bytes processed", f"{stats.bytes_processed:,}")
     table.add_row("Bytes processed (human)", f"{format_bytes(stats.bytes_processed)}")
     table.add_row("", "")
@@ -774,7 +790,7 @@ Examples:
     console.print()
 
     if args.dry_run:
-        console.print("[bold yellow]DRY RUN MODE - No files will be copied[/]\n")
+        console.print("[bold yellow]DRY RUN MODE - No files will be moved[/]\n")
 
     # Run the archive
     try:

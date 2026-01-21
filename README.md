@@ -1,13 +1,14 @@
 # Data Archiver
 
-A fast, multi-process file archiver that copies files older than a specified date from a source directory tree to a destination, preserving directory structure.
+A fast, multi-process file archiver that moves files older than a specified date from a source directory tree to a destination, preserving directory structure. Files are verified after copy and only deleted from the source after successful verification.
 
 ## Features
 
+- **Safe file moving**: Copies files, verifies hash integrity, then deletes source
 - **Flexible date parsing**: Supports natural language dates like "3 years ago", year-only "2021", or ISO format "2025-06-01"
-- **Fast hashing**: Uses xxhash (xxh3_128) for extremely fast file comparison
+- **Fast hashing**: Uses xxhash (xxh3_128) for extremely fast file comparison and verification
 - **Multi-process architecture**: Uses 8+ worker processes for parallel file processing
-- **Producer/consumer pattern**: Dedicated crawler process feeds work to hash/copy workers
+- **Producer/consumer pattern**: Dedicated crawler process feeds work to hash/move workers
 - **Conflict detection**: Identifies files with same path but different content
 - **Dry run mode**: Preview what would be archived without making changes
 - **Verbose logging**: Detailed logs with timestamps and file hashes
@@ -119,7 +120,7 @@ Created only if conflicts are detected. Contains the full source paths of files 
    - Check if destination file exists
    - Compare file sizes (quick check)
    - Compute xxhash for content comparison if sizes match
-   - Copy new files, preserving directory structure
+   - Move new files (copy → verify hash → delete source)
    - Update modification times to match source
    - Track conflicts for manual review
 
@@ -130,7 +131,7 @@ Created only if conflicts are detected. Contains the full source paths of files 
 After completion, you'll see a summary table including:
 - Directories crawled
 - Files found (matching age criteria)
-- Files copied / skipped / updated
+- Files moved / skipped / updated
 - Conflicts and errors
 - Bytes copied (exact and human-readable)
 - Total runtime and throughput
