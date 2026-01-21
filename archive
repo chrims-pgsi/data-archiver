@@ -330,13 +330,17 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
             if abs(dest_mtime - task.source_mtime) > 1:  # 1 second tolerance
                 if not dry_run:
                     os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
+                    # Delete source since destination is verified identical
+                    task.source_path.unlink()
                 return FileResult(
                     task=task,
                     action=FileAction.MTIME_UPDATED,
                     source_hash=source_hash,
                 )
 
-            # File already exists and is identical
+            # File already exists and is identical - delete source
+            if not dry_run:
+                task.source_path.unlink()
             return FileResult(
                 task=task,
                 action=FileAction.SKIPPED_EXISTS,
