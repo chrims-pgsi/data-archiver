@@ -20,6 +20,7 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import signal
 import shutil
 import sys
 import time
@@ -118,6 +119,7 @@ class ArchiveStats:
     conflict_files: list = field(default_factory=list)
     log_file: Optional[Path] = None
     conflicts_file: Optional[Path] = None
+    interrupted: bool = False
 
     @property
     def files_removed(self) -> int:
@@ -438,6 +440,16 @@ def run_archive(
     result_queue = mp.Queue()
     stats_queue = mp.Queue()
     crawl_done = mp.Value('i', 0)
+    interrupted = mp.Value('i', 0)
+
+    # Set up signal handler for graceful shutdown
+    def signal_handler(signum, frame):
+        interrupted.value = 1
+        console.print("\n[bold yellow]Signal received, shutting down gracefully...[/]")
+        logger.info("Interrupt signal received, shutting down...")
+
+    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
 
     # Start crawler process
     crawler = Process(
@@ -481,7 +493,7 @@ def run_archive(
 
         active_workers = NUM_WORKERS
 
-        while active_workers > 0 or not result_queue.empty() or not stats_queue.empty():
+        while (active_workers > 0 or not result_queue.empty() or not stats_queue.empty()) and not interrupted.value:
             # Check stats queue for crawler updates
             while not stats_queue.empty():
                 try:
@@ -563,10 +575,30 @@ def run_archive(
 
             time.sleep(0.05)
 
-    # Wait for all processes to complete
-    crawler.join(timeout=5)
-    for w in workers:
-        w.join(timeout=5)
+    # Restore signal handlers
+    signal.signal(signal.SIGINT, original_sigint)
+    signal.signal(signal.SIGTERM, original_sigterm)
+
+    # Handle interruption
+    if interrupted.value:
+        stats.interrupted = True
+        logger.info("Interrupted - terminating workers...")
+        console.print("[yellow]Terminating workers...[/]")
+
+        # Terminate all processes
+        crawler.terminate()
+        for w in workers:
+            w.terminate()
+
+        # Wait briefly for termination
+        crawler.join(timeout=2)
+        for w in workers:
+            w.join(timeout=2)
+    else:
+        # Wait for all processes to complete normally
+        crawler.join(timeout=5)
+        for w in workers:
+            w.join(timeout=5)
 
     stats.end_time = time.time()
 
@@ -602,7 +634,7 @@ def log_result(logger: logging.Logger, result: FileResult, dry_run: bool):
         )
     elif result.action == FileAction.SKIPPED_EXISTS:
         logger.debug(
-            f"{prefix}SKIPPED (exists, same size+mtime): {path} | "
+            f"{prefix}ALREADY ARCHIVED (same size+mtime): {path} | "
             f"size={result.task.source_size}"
         )
     elif result.action == FileAction.MTIME_UPDATED:
@@ -634,14 +666,20 @@ def log_summary(logger: logging.Logger, stats: ArchiveStats, dry_run: bool):
     """Log the final summary."""
     duration = stats.end_time - stats.start_time
 
+    suffix = ""
+    if stats.interrupted:
+        suffix = " (INTERRUPTED)"
+    elif dry_run:
+        suffix = " (DRY RUN)"
+
     logger.info("=" * 80)
-    logger.info("ARCHIVE SUMMARY" + (" (DRY RUN)" if dry_run else ""))
+    logger.info("ARCHIVE SUMMARY" + suffix)
     logger.info("=" * 80)
     logger.info(f"Directories crawled: {stats.directories_crawled:,}")
     logger.info(f"Total files found (older than cutoff): {stats.total_files_found:,}")
     logger.info(f"Files processed: {stats.files_processed:,}")
     logger.info(f"Files moved: {stats.files_moved:,}")
-    logger.info(f"Files skipped (already exist): {stats.files_skipped:,}")
+    logger.info(f"Files already in dest (verified): {stats.files_skipped:,}")
     logger.info(f"Files with mtime updated: {stats.files_mtime_updated:,}")
     logger.info(f"Conflicts: {stats.conflicts:,}")
     logger.info(f"Errors: {stats.errors:,}")
@@ -663,10 +701,23 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
     """Print a colorful summary to the console."""
     duration = stats.end_time - stats.start_time
 
+    if stats.interrupted:
+        title_suffix = " (INTERRUPTED)"
+        title_style = "bold red"
+        border_style = "red"
+    elif dry_run:
+        title_suffix = " (DRY RUN)"
+        title_style = "bold magenta"
+        border_style = "blue"
+    else:
+        title_suffix = ""
+        title_style = "bold magenta"
+        border_style = "blue"
+
     table = Table(
-        title="[bold]Archive Summary" + (" (DRY RUN)" if dry_run else ""),
-        title_style="bold magenta",
-        border_style="blue",
+        title="[bold]Archive Summary" + title_suffix,
+        title_style=title_style,
+        border_style=border_style,
     )
 
     table.add_column("Metric", style="cyan", no_wrap=True)
@@ -677,7 +728,7 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
     table.add_row("Files processed", f"{stats.files_processed:,}")
     table.add_row("", "")
     table.add_row("Files moved (new)", f"[bold green]{stats.files_moved:,}[/]")
-    table.add_row("Files skipped (already archived)", f"{stats.files_skipped:,}")
+    table.add_row("Files already in dest (verified)", f"{stats.files_skipped:,}")
     table.add_row("Files mtime updated", f"{stats.files_mtime_updated:,}")
 
     if stats.conflicts > 0:
@@ -854,13 +905,12 @@ Examples:
         # Print summary
         print_summary(stats, args.dry_run)
 
-        # Exit with error code if there were problems
-        if stats.errors > 0 or stats.conflicts > 0:
+        # Exit with appropriate code
+        if stats.interrupted:
+            sys.exit(130)
+        elif stats.errors > 0 or stats.conflicts > 0:
             sys.exit(1)
 
-    except KeyboardInterrupt:
-        console.print("\n[bold red]Interrupted by user[/]")
-        sys.exit(130)
     except Exception as e:
         console.print(f"\n[bold red]Error:[/] {e}")
         sys.exit(1)
