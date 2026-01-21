@@ -114,6 +114,8 @@ class ArchiveStats:
     start_time: float = field(default_factory=time.time)
     end_time: Optional[float] = None
     conflict_files: list = field(default_factory=list)
+    log_file: Optional[Path] = None
+    conflicts_file: Optional[Path] = None
 
 
 def setup_logging(log_directory: Path, timestamp: str) -> logging.Logger:
@@ -401,6 +403,7 @@ def run_archive(
 ) -> ArchiveStats:
     """Run the archive operation."""
     timestamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
+    log_file = log_directory / f"data-archiver-{timestamp}.log"
 
     # Setup logging
     log_directory.mkdir(parents=True, exist_ok=True)
@@ -421,6 +424,7 @@ def run_archive(
 
     stats = ArchiveStats()
     stats.start_time = time.time()
+    stats.log_file = log_file
 
     # Create queues for inter-process communication
     task_queue = mp.Queue(maxsize=10000)
@@ -555,11 +559,11 @@ def run_archive(
 
     # Write conflicts file
     if stats.conflict_files:
-        conflicts_file = log_directory / f"conflicts-{timestamp}.txt"
-        with open(conflicts_file, 'w') as f:
+        stats.conflicts_file = log_directory / f"conflicts-{timestamp}.txt"
+        with open(stats.conflicts_file, 'w') as f:
             for path in stats.conflict_files:
                 f.write(f"{path}\n")
-        logger.info(f"Conflicts written to: {conflicts_file}")
+        logger.info(f"Conflicts written to: {stats.conflicts_file}")
 
     # Log final summary
     log_summary(logger, stats, dry_run)
@@ -676,13 +680,26 @@ def print_summary(stats: ArchiveStats, dry_run: bool):
     console.print()
     console.print(table)
 
+    if stats.errors > 0:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold yellow]Warning:[/] {stats.errors} error(s) occurred!\n"
+                f"See log file for details:\n[cyan]{stats.log_file}[/]",
+                title="[bold red]Errors Occurred",
+                border_style="red",
+            )
+        )
+
     if stats.conflicts > 0:
         console.print()
+        conflicts_path = stats.conflicts_file or "conflicts file"
         console.print(
             Panel(
                 f"[bold yellow]Warning:[/] {stats.conflicts} conflict(s) detected!\n"
                 "Files with the same path but different content were found.\n"
-                "Check the conflicts file in the log directory for details.",
+                f"Conflicts file: [cyan]{conflicts_path}[/]\n"
+                f"Log file: [cyan]{stats.log_file}[/]",
                 title="[bold red]Conflicts Detected",
                 border_style="red",
             )
