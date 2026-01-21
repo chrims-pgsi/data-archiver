@@ -51,7 +51,7 @@ from rich.text import Text
 
 # Constants
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for hashing (CIFS-compatible)
-NUM_WORKERS = max(8, mp.cpu_count())
+NUM_WORKERS = min(8, mp.cpu_count())
 SENTINEL = None  # Signal to workers that crawling is done
 APP_NAME = "data-archiver"
 
