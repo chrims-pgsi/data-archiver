@@ -197,6 +197,7 @@ def format_duration(seconds: float) -> str:
 def crawler_process(
     source_dir: Path,
     dest_dir: Path,
+    source_root: Path,
     cutoff_date: datetime,
     task_queue: Queue,
     stats_queue: Queue,
@@ -223,7 +224,7 @@ def crawler_process(
 
                     # Check if file is older than cutoff
                     if mtime < cutoff_timestamp:
-                        relative_path = source_path.relative_to(source_dir)
+                        relative_path = source_path.relative_to(source_root)
                         dest_path = dest_dir / relative_path
 
                         task = FileTask(
@@ -363,6 +364,7 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
 def run_archive(
     source: Path,
     destination: Path,
+    source_root: Path,
     cutoff_date: datetime,
     log_directory: Path,
     dry_run: bool,
@@ -380,6 +382,8 @@ def run_archive(
     logger.info("=" * 80)
     logger.info(f"Source: {source}")
     logger.info(f"Destination: {destination}")
+    if source_root != source:
+        logger.info(f"Source root: {source_root}")
     logger.info(f"Cutoff date: {cutoff_date}")
     logger.info(f"Dry run: {dry_run}")
     logger.info(f"Workers: {NUM_WORKERS}")
@@ -397,7 +401,7 @@ def run_archive(
     # Start crawler process
     crawler = Process(
         target=crawler_process,
-        args=(source, destination, cutoff_date, task_queue, stats_queue, crawl_done, dry_run)
+        args=(source, destination, source_root, cutoff_date, task_queue, stats_queue, crawl_done, dry_run)
     )
     crawler.start()
 
@@ -696,6 +700,13 @@ Examples:
         help='Directory for log files (default: ~/.local/state/data-archiver)',
     )
     parser.add_argument(
+        '--source-root', '-r',
+        type=Path,
+        default=None,
+        dest='source_root',
+        help='Root for calculating relative paths (default: same as --source)',
+    )
+    parser.add_argument(
         '--dry-run', '-n',
         action='store_true',
         dest='dry_run',
@@ -703,6 +714,10 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Default source_root to source if not specified
+    if args.source_root is None:
+        args.source_root = args.source
 
     # Validate source directory
     if not args.source.exists():
@@ -713,6 +728,13 @@ Examples:
         console.print(f"[bold red]Error:[/] Source is not a directory: {args.source}")
         sys.exit(1)
 
+    # Validate source is under source_root
+    try:
+        args.source.resolve().relative_to(args.source_root.resolve())
+    except ValueError:
+        console.print(f"[bold red]Error:[/] Source must be under source-root: {args.source} is not under {args.source_root}")
+        sys.exit(1)
+
     # Parse the cutoff date
     try:
         cutoff_date = parse_date(args.older_than)
@@ -721,14 +743,21 @@ Examples:
         sys.exit(1)
 
     # Display configuration
+    config_lines = [
+        f"[bold]Source:[/] {args.source}",
+        f"[bold]Destination:[/] {args.destination}",
+    ]
+    if args.source_root.resolve() != args.source.resolve():
+        config_lines.append(f"[bold]Source root:[/] {args.source_root}")
+    config_lines.extend([
+        f"[bold]Older than:[/] {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"[bold]Log directory:[/] {args.log_directory}",
+        f"[bold]Workers:[/] {NUM_WORKERS}",
+        f"[bold]Dry run:[/] {'Yes' if args.dry_run else 'No'}",
+    ])
     console.print()
     console.print(Panel(
-        f"[bold]Source:[/] {args.source}\n"
-        f"[bold]Destination:[/] {args.destination}\n"
-        f"[bold]Older than:[/] {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"[bold]Log directory:[/] {args.log_directory}\n"
-        f"[bold]Workers:[/] {NUM_WORKERS}\n"
-        f"[bold]Dry run:[/] {'Yes' if args.dry_run else 'No'}",
+        "\n".join(config_lines),
         title="[bold blue]Data Archiver Configuration",
         border_style="blue",
     ))
@@ -742,6 +771,7 @@ Examples:
         stats = run_archive(
             source=args.source.resolve(),
             destination=args.destination.resolve(),
+            source_root=args.source_root.resolve(),
             cutoff_date=cutoff_date,
             log_directory=args.log_directory.resolve(),
             dry_run=args.dry_run,

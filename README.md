@@ -47,7 +47,7 @@ uv run ./archive --source /path/to/source --destination /path/to/dest --older-th
 
 ```
 usage: archive [-h] --source SOURCE --destination DESTINATION --older-than OLDER_THAN
-               [--log-directory LOG_DIRECTORY] [--dry-run]
+               [--log-directory LOG_DIRECTORY] [--source-root SOURCE_ROOT] [--dry-run]
 
 Archive files older than a specified date.
 
@@ -60,6 +60,8 @@ options:
                         Archive files older than this date
   --log-directory, -l LOG_DIRECTORY
                         Directory for log files (default: ~/.local/state/data-archiver)
+  --source-root, -r SOURCE_ROOT
+                        Root for calculating relative paths (default: same as --source)
   --dry-run, -n         Show what would be done without actually copying files
 ```
 
@@ -86,6 +88,10 @@ The `--older-than` option accepts many formats:
 
 # Archive with all short options
 ./archive -s /src -d /dst -o '2021-01-01' -l ./logs -n
+
+# Use --source-root to preserve directory structure relative to a parent
+# This archives /srv/data/photos/* to /mnt/archive/photos/* (not /mnt/archive/*)
+./archive -s /srv/data/photos -d /mnt/archive -r /srv/data -o '2 years ago'
 ```
 
 ## Output Files
