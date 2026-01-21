@@ -139,29 +139,39 @@ def setup_logging(log_directory: Path, timestamp: str) -> logging.Logger:
 
 def parse_date(date_string: str) -> datetime:
     """Parse a flexible date string into a datetime object."""
-    # Try dateparser for natural language dates
-    parsed = dateparser.parse(
-        date_string,
-        settings={
-            'PREFER_DATES_FROM': 'past',
-            'RETURN_AS_TIMEZONE_AWARE': False,
-        }
-    )
+    date_string = date_string.strip()
 
-    if parsed is None:
-        # Try some common formats directly
-        formats = ['%Y', '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y']
-        for fmt in formats:
-            try:
-                parsed = datetime.strptime(date_string, fmt)
-                break
-            except ValueError:
-                continue
+    # Try strict formats first for numeric-looking strings
+    # This prevents dateparser from misinterpreting typos like "20221"
+    strict_formats = [
+        ('%Y', 4),           # 2022 (exactly 4 digits)
+        ('%Y-%m-%d', None),  # 2022-01-15
+        ('%Y/%m/%d', None),  # 2022/01/15
+        ('%Y-%m', None),     # 2022-01
+        ('%Y/%m', None),     # 2022/01
+    ]
 
-    if parsed is None:
-        raise ValueError(f"Could not parse date: {date_string}")
+    for fmt, expected_len in strict_formats:
+        if expected_len is not None and len(date_string) != expected_len:
+            continue
+        try:
+            return datetime.strptime(date_string, fmt)
+        except ValueError:
+            continue
 
-    return parsed
+    # For natural language dates (containing letters or spaces), use dateparser
+    if any(c.isalpha() or c.isspace() for c in date_string):
+        parsed = dateparser.parse(
+            date_string,
+            settings={
+                'PREFER_DATES_FROM': 'past',
+                'RETURN_AS_TIMEZONE_AWARE': False,
+            }
+        )
+        if parsed is not None:
+            return parsed
+
+    raise ValueError(f"Could not parse date: {date_string}")
 
 
 def compute_hash(filepath: Path) -> str:
