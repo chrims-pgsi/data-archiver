@@ -303,18 +303,24 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
             dest_size = dest_stat.st_size
             dest_mtime = dest_stat.st_mtime
 
-            # Quick size check first
+            # Different sizes = conflict (no need to hash)
             if dest_size != task.source_size:
-                # Conflict - different sizes
-                source_hash = compute_hash(task.source_path)
                 return FileResult(
                     task=task,
                     action=FileAction.CONFLICT,
-                    source_hash=source_hash,
                     error_message=f"Size mismatch: source={task.source_size}, dest={dest_size}"
                 )
 
-            # Same size - compute hashes
+            # Same size and same mtime = assume identical (no need to hash)
+            if abs(dest_mtime - task.source_mtime) <= 1:  # 1 second tolerance
+                if not dry_run:
+                    task.source_path.unlink()
+                return FileResult(
+                    task=task,
+                    action=FileAction.SKIPPED_EXISTS,
+                )
+
+            # Same size but different mtime = need to hash to verify
             source_hash = compute_hash(task.source_path)
             dest_hash = compute_hash(task.dest_path)
 
@@ -328,24 +334,13 @@ def process_file(task: FileTask, dry_run: bool) -> FileResult:
                     error_message="Hash mismatch with same size"
                 )
 
-            # Files are identical - check mtime
-            if abs(dest_mtime - task.source_mtime) > 1:  # 1 second tolerance
-                if not dry_run:
-                    os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
-                    # Delete source since destination is verified identical
-                    task.source_path.unlink()
-                return FileResult(
-                    task=task,
-                    action=FileAction.MTIME_UPDATED,
-                    source_hash=source_hash,
-                )
-
-            # File already exists and is identical - delete source
+            # Hashes match - update dest mtime to match source, delete source
             if not dry_run:
+                os.utime(task.dest_path, (task.source_mtime, task.source_mtime))
                 task.source_path.unlink()
             return FileResult(
                 task=task,
-                action=FileAction.SKIPPED_EXISTS,
+                action=FileAction.MTIME_UPDATED,
                 source_hash=source_hash,
             )
 
@@ -589,8 +584,8 @@ def log_result(logger: logging.Logger, result: FileResult, dry_run: bool):
         )
     elif result.action == FileAction.SKIPPED_EXISTS:
         logger.debug(
-            f"{prefix}SKIPPED (exists): {path} | "
-            f"hash={result.source_hash}"
+            f"{prefix}SKIPPED (exists, same size+mtime): {path} | "
+            f"size={result.task.source_size}"
         )
     elif result.action == FileAction.MTIME_UPDATED:
         logger.info(
@@ -598,12 +593,18 @@ def log_result(logger: logging.Logger, result: FileResult, dry_run: bool):
             f"hash={result.source_hash}"
         )
     elif result.action == FileAction.CONFLICT:
-        logger.warning(
-            f"{prefix}CONFLICT: {path} | "
-            f"source_hash={result.source_hash} | "
-            f"dest_hash={result.dest_hash} | "
-            f"{result.error_message}"
-        )
+        if result.source_hash:
+            logger.warning(
+                f"{prefix}CONFLICT: {path} | "
+                f"source_hash={result.source_hash} | "
+                f"dest_hash={result.dest_hash} | "
+                f"{result.error_message}"
+            )
+        else:
+            logger.warning(
+                f"{prefix}CONFLICT: {path} | "
+                f"{result.error_message}"
+            )
     elif result.action == FileAction.ERROR:
         logger.error(
             f"{prefix}ERROR: {path} | "
